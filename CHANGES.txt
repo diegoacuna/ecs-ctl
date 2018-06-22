@@ -1,0 +1,3 @@
+v0.1.2, 2018-06-22 -- Add long_description to setup.py.
+v0.1.1, 2018-06-22 -- Add README to pypi.
+v0.1.0, 2018-06-22 -- Initial release.

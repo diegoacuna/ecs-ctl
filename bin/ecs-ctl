@@ -1,0 +1,141 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+  ecs-ctl v0.1.2
+  author: diego.acuna@mailbox.org
+
+  Manage Amazon ECS like with kubectl
+"""
+from argparse import RawTextHelpFormatter
+import argparse
+import ConfigParser
+import logging
+import boto3
+import sys
+from tabulate import tabulate
+import subprocess
+import json
+import os
+
+def execute_cmd(cmd, options=None, shell=None):
+  params_list = [cmd] if options is None else [cmd] + options
+  if shell is None:
+    p = subprocess.Popen(params_list, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  else:
+    p = subprocess.Popen(params_list, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+  output, error = p.communicate()
+  return output, error, p.returncode
+
+def instrospect_tasks(cluster):
+  response = client.list_tasks(cluster=cluster)
+  tasks = response['taskArns']
+  # now we ask for full information of tasks
+  if response['taskArns']:
+    elevatedTasks = client.describe_tasks(cluster=cluster, tasks=response['taskArns'])
+    tasks = elevatedTasks['tasks']
+  return tasks
+
+def instrospect_clusters(with_tasks=True):
+  clusters = client.list_clusters()
+  if with_tasks:
+    tasksAws = {}
+    for cluster in clusters['clusterArns']:
+      tasksAws[cluster] = instrospect_tasks(cluster)
+    return clusters, tasksAws
+  return clusters
+
+def read_ecs_key(argsKey):
+  try:
+    # first, we try to get the key from the configuration file
+    cp = ConfigParser.ConfigParser()
+    cp.read(os.path.expanduser("~/.ecs_ctl"))
+    return cp.get('default', 'ecsKey')
+  except (ConfigParser.NoOptionError, ConfigParser.NoSectionError), e:
+    # if not, we use the key from the command line arguments
+    if argsKey:
+      return argsKey
+    return None
+
+if __name__ == "__main__":
+  # valid arguments for command line parsing
+  parser = argparse.ArgumentParser(formatter_class=RawTextHelpFormatter, epilog="Available Actions:\n" + \
+                                                                                "- get: get elements from ECS. For example: get clusters, get tasks\n" + \
+                                                                                "- exec: executes a command on a container. For example: exec CONTAINER_NAME bash (opens a bash terminal on the container)\n" + \
+                                                                                "\n For the exec action you need to provide a SSH key to access the ECS instance running the container. You can do this in two different ways:\n" + \
+                                                                                " - .ecs_ctl configuration file on your home path (~) with a section [default] and the path of the key in the property ecsKey\n" + \
+                                                                                " - Using the --key (or -k) parameter of the program")
+  parser.add_argument("action", help="Action to execute. It can be one of: \n - get: get information of an element\n - exec: executes a command in a container")
+  parser.add_argument('element', nargs='?', default='tasks', help="Element where you want to execute the action. It can be one of: \n - clusters\n - tasks")
+  parser.add_argument('command', nargs='?', help="Command to execute on the container (for the action exec). For example: \n - \"exec CONTAINER_NAME bash\" opens a bash terminal on the CONTAINER_NAME")
+  parser.add_argument('-k', '--key', help='SSH key used to connect to ECS instances')
+  parser.add_argument('-d', '--debug', action='store_true', help='Enable debugging of the application')
+
+  # by default we want to show argparse help messages
+  if len(sys.argv)==1:
+    parser.print_help()
+    sys.exit(1)
+  # get cmd arguments
+  args = parser.parse_args()
+
+  if args.debug:
+    logging.basicConfig(level=logging.INFO)
+
+  client = boto3.client('ecs')
+  # proccess the current action
+  if args.action == 'get' and args.element == 'clusters':
+    clusters = instrospect_clusters(with_tasks=False)
+    print '\n'.join(clusters['clusterArns'])
+  elif args.action == 'get' and args.element == 'tasks':
+    clusters, tasksAws = instrospect_clusters()
+    # we create the tasks table
+    headers = ["ARN", "Containers", "Status", "Started At"]
+    for cluster, tasks in tasksAws.iteritems():
+      print "  Tasks in cluster {0}  ".format(cluster).center(130, '=')
+      table = []
+      for task in tasks:
+        containers = ",".join([c['name'] for c in task['containers']])
+        table.append([task['taskArn'], containers, task['lastStatus'], task['startedAt']])
+      print(tabulate(table, headers=headers))
+      print "\n"
+  elif args.action == 'exec' and args.element and args.command == 'bash':
+    ecsKey = read_ecs_key(args.key)
+    if not ecsKey:
+      print "You need to specify the SSH key of the ECS instance to connect! (HINT: use .ecs_ctl config file or the parameter --key)"
+      sys.exit(1)
+    containerName = args.element
+    logging.info("Trying to connect to container {0}...".format(containerName))
+    # we look for the first container with name containerName in any cluster
+    clusters, tasksAws = instrospect_clusters()
+    container = None
+    containerCluster = None
+    for cluster, tasks in tasksAws.iteritems():
+      for task in tasks:
+        containerFind = filter(lambda c: c['name'] == containerName, task['containers'])
+        if containerFind:
+          container = task['containerInstanceArn']
+          break
+      if container != None:
+        containerCluster = cluster
+        break
+    logging.info("The cluster of the container is {0} and the container instance is {1}".format(containerCluster, container))
+    if container:
+      response = client.describe_container_instances(cluster=containerCluster, containerInstances=[container])
+      ec2InstanceId = response['containerInstances'][0]['ec2InstanceId']
+      logging.info("The ID of the EC2 instance running the ECS container is {0}".format(ec2InstanceId))
+      client = boto3.client('ec2')
+      ec2Instance = client.describe_instances(InstanceIds=[ec2InstanceId])
+      ec2IpAddress = ec2Instance['Reservations'][0]['Instances'][0]['PublicIpAddress']
+      logging.info("The IP of the EC2 instance running the ECS container is {0}".format(ec2IpAddress))
+      params = ['-i', ecsKey, "ec2-user@{0}".format(ec2IpAddress), "curl -s http://127.0.0.1:51678/v1/tasks"]
+      output, error, returncode = execute_cmd("ssh", options=params)
+      dockerOutput = json.loads(output)
+      for dockerTask in dockerOutput['Tasks']:
+        for dockerContainer in dockerTask['Containers']:
+          if dockerContainer['Name'] == containerName:
+            containerProcessParams = ["ssh", "-i", ecsKey, "-t", "ec2-user@{0}".format(ec2IpAddress), "docker exec -it {0} bash".format(dockerContainer['DockerId'])]
+            sys.exit(subprocess.call(containerProcessParams))
+      #json.loads(output), error, returncode
+    else:
+      print "No container with name {0} found!".format(containerName)
+  else:
+    print "Unrecognized command."
